@@ -741,27 +741,40 @@ def _export_pdf_per_layout(output_dir, basename_prefix="Sheet"):
             pass
 
         # Use Print command with PDF output for individual layouts
-        # Try multiple command syntaxes for compatibility
+        # Try multiple sequences for compatibility on macOS
         export_success = False
-
-        # Single command with proper quoting (step-by-step variants are not supported)
-        try:
-            logger.debug(
-                "Trying single-line Print command for view: %s", pv.PageName)
-            safe_path = outpath.replace('\\', '\\\\').replace('"', '\\"')
-            safe_view = pv.PageName.replace('"', '\\"')
-            cmd = u'-_Print _Destination=_PDF _OutputType=_Vector _View="{}" _OutputFile="{}" _Go'.format(
-                safe_view, safe_path)
-            logger.debug("Executing: %s", cmd)
-            rs.Command(cmd, echo=False)
-            time.sleep(1.0)
-            if os.path.exists(outpath) and os.path.getsize(outpath) > 0:
-                logger.info("Exported layout PDF: %s", outpath)
-                paths.append(outpath)
-                export_success = True
-        except Exception as e:
-            logger.debug("Single-line Print command failed: %s",
-                         e, exc_info=True)
+        safe_path = outpath.replace('\\', '\\\\').replace('"', '\\"')
+        try_sequences = [
+            [
+                u'-_Print _Setup _Destination=_RhinoPDF _OutputType=_Vector _Enter',
+                u'-_Print _View=_Current _OutputFile="{}" _Go'.format(safe_path)
+            ],
+            [
+                u'-_Print _Destination=_RhinoPDF _OutputType=_Vector _View=_Current _Enter',
+                u'-_Print _OutputFile="{}" _Go'.format(safe_path)
+            ],
+            [
+                u'-_Print _Destination=_PDF _OutputType=_Vector _View=_Current _Enter',
+                u'-_Print _OutputFile="{}" _Go'.format(safe_path)
+            ],
+            [
+                u'-_Print _Destination=_PDF _View=_Current _OutputFile="{}" _Go'.format(safe_path)
+            ],
+        ]
+        for seq in try_sequences:
+            try:
+                logger.debug("Trying print sequence for view '%s': %s", pv.PageName, " | ".join(seq))
+                for c in seq:
+                    rs.Command(c, echo=False)
+                    time.sleep(0.4)
+                time.sleep(0.8)
+                if os.path.exists(outpath) and os.path.getsize(outpath) > 0:
+                    logger.info("Exported layout PDF: %s", outpath)
+                    paths.append(outpath)
+                    export_success = True
+                    break
+            except Exception as e:
+                logger.debug("Print sequence failed: %s", e, exc_info=True)
 
         # Variant 3: Try using RhinoCommon Print functionality if available
         if not export_success:
