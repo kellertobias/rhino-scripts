@@ -747,7 +747,8 @@ def _export_pdf_per_layout(output_dir, basename_prefix="Sheet"):
         try_sequences = [
             [
                 u'-_Print _Setup _Destination=_RhinoPDF _OutputType=_Vector _Enter',
-                u'-_Print _View=_Current _OutputFile="{}" _Go'.format(safe_path)
+                u'-_Print _View=_Current _OutputFile="{}" _Go'.format(
+                    safe_path)
             ],
             [
                 u'-_Print _Destination=_RhinoPDF _OutputType=_Vector _View=_Current _Enter',
@@ -758,12 +759,14 @@ def _export_pdf_per_layout(output_dir, basename_prefix="Sheet"):
                 u'-_Print _OutputFile="{}" _Go'.format(safe_path)
             ],
             [
-                u'-_Print _Destination=_PDF _View=_Current _OutputFile="{}" _Go'.format(safe_path)
+                u'-_Print _Destination=_PDF _View=_Current _OutputFile="{}" _Go'.format(
+                    safe_path)
             ],
         ]
         for seq in try_sequences:
             try:
-                logger.debug("Trying print sequence for view '%s': %s", pv.PageName, " | ".join(seq))
+                logger.debug("Trying print sequence for view '%s': %s",
+                             pv.PageName, " | ".join(seq))
                 for c in seq:
                     rs.Command(c, echo=False)
                     time.sleep(0.4)
