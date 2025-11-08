@@ -1,0 +1,11 @@
+.venv/
+*.dwg
+*.DWG
+*.pdf
+*.PDF
+*.png
+*.PNG
+*.log
+*.LOG
+
+dwg_to_png.py
