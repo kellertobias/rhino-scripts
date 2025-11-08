@@ -25,6 +25,8 @@ import tempfile
 # ---------- logging ----------
 logger = logging.getLogger("assemble_layouts")
 
+__version__ = "0.3.2"
+
 
 def _default_log_path():
     """
@@ -87,13 +89,14 @@ def _get_page_format_dimensions(format_name, landscape=False):
     Get page width and height in millimeters for a given format name.
 
     Args:
-        format_name: Page format name (A4, A3, A2, A1) - case insensitive
+        format_name: Page format name (A5, A4, A3, A2, A1) - case insensitive
         landscape: If True, swap width and height for landscape orientation
 
     Returns:
         tuple: (width_mm, height_mm) or None if format not recognized
     """
     formats = {
+        'A5': (148.0, 210.0),
         'A4': (210.0, 297.0),
         'A3': (297.0, 420.0),
         'A2': (420.0, 594.0),
@@ -139,12 +142,12 @@ def _prompt_orientation():
 
 def _prompt_page_format():
     """
-    Prompt user to select a page format (A4, A3, A2, A1) and orientation.
+    Prompt user to select a page format (A5, A4, A3, A2, A1) and orientation.
 
     Returns:
         tuple: (width_mm, height_mm) or None if cancelled
     """
-    prompt = "Select page format (A4, A3, A2, A1) [A3]: "
+    prompt = "Select page format (A5, A4, A3, A2, A1) [A3]: "
     default = "A3"
     result = rs.GetString(prompt, default)
 
@@ -322,6 +325,24 @@ def _activate_layout_or_create(name, width_mm=420.0, height_mm=297.0):
         except Exception:
             logger.debug("Failed to set CurrentView to layout %s",
                          page_view.PageName, exc_info=True)
+        # Ensure page size and name are correct
+        try:
+            page_view.PageWidth = width_mm
+            page_view.PageHeight = height_mm
+        except Exception:
+            logger.debug(
+                "Failed to enforce page dimensions after creation.", exc_info=True)
+        try:
+            # Ensure page is named correctly (prefer RhinoCommon setter)
+            page_view.PageName = name
+        except Exception:
+            logger.debug("Direct PageName set failed.", exc_info=True)
+            try:
+                # Fallback to rename by id
+                rs.RenameLayout(page_id, name)
+            except Exception:
+                logger.debug(
+                    "Rename after creation failed (may already be correct).", exc_info=True)
         logger.debug("Created layout '%s' with size %.1f x %.1f mm",
                      name, width_mm, height_mm)
         return page_view, page_id
@@ -447,6 +468,58 @@ def _resolve_layout_guid(page_view):
         logger.debug(
             "Failed to resolve layout GUID via RhinoCommon.", exc_info=True)
     return None
+
+
+def _rename_layout(page_view, target_name):
+    """
+    Robustly rename a layout (page view) to target_name.
+    Tries RhinoCommon first, falls back to RhinoScriptSyntax by GUID.
+    Logs before/after state for debugging.
+    Returns True on success.
+    """
+    try:
+        before_names = [
+            pv.PageName for pv in Rhino.RhinoDoc.ActiveDoc.Views.GetPageViews()]
+        logger.debug("Renaming layout. Before names: %s", before_names)
+        # Try direct set on provided page_view
+        try:
+            old = page_view.PageName
+            page_view.PageName = target_name
+            logger.debug(
+                "Set PageName via RhinoCommon: '%s' -> '%s'", old, target_name)
+        except Exception:
+            logger.debug(
+                "Direct PageName set on page_view failed.", exc_info=True)
+        # Verify
+        after_names = [
+            pv.PageName for pv in Rhino.RhinoDoc.ActiveDoc.Views.GetPageViews()]
+        if target_name in after_names:
+            logger.info("Layout renamed to '%s' (verified)", target_name)
+            return True
+        # Fallback to GUID-based rename
+        guid = _resolve_layout_guid(page_view)
+        logger.debug("Fallback rename: resolved guid=%s for '%s'",
+                     str(guid), getattr(page_view, "PageName", "?"))
+        if guid:
+            try:
+                rs.RenameLayout(guid, target_name)
+            except Exception:
+                logger.debug("rs.RenameLayout by guid failed.", exc_info=True)
+        # Re-verify
+        final_names = [
+            pv.PageName for pv in Rhino.RhinoDoc.ActiveDoc.Views.GetPageViews()]
+        logger.debug("Renaming layout. After names: %s", final_names)
+        ok = target_name in final_names
+        if ok:
+            logger.info(
+                "Layout renamed to '%s' (post-fallback verified)", target_name)
+        else:
+            logger.warning(
+                "Layout rename to '%s' did not reflect in views list.", target_name)
+        return ok
+    except Exception:
+        logger.debug("Rename layout helper failed.", exc_info=True)
+        return False
 
 
 def _add_or_replace_single_detail(page_view, margin_mm=10.0):
@@ -587,14 +660,7 @@ def _set_detail_scale(detail_id, paper_mm_per_model_unit=1.0/0.2, model_unit="Me
     """
     Configure detail scale using rs.DetailScale:
       paper_length(mm) : model_length(model_unit)
-
-    Args:
-        detail_id: GUID of the detail viewport
-        paper_mm_per_model_unit: Ratio of paper_mm / model_length_in_model_unit
-                                 Example: if 1mm paper = 0.2m model, then this is 1.0/0.2 = 5.0
-        model_unit: Unit string for the model (default: "Meters")
-
-    The scale is set as: paper_length(mm) : model_length(model_unit)
+    (Deprecated: prefer _apply_detail_scale_mm)
     """
     try:
         # Calculate model_length from the ratio
@@ -612,6 +678,90 @@ def _set_detail_scale(detail_id, paper_mm_per_model_unit=1.0/0.2, model_unit="Me
         return True
     except Exception:
         logger.debug("Failed to set detail scale.", exc_info=True)
+        return False
+
+
+def _apply_detail_scale_mm(detail_id, scale_model_mm):
+    """
+    Set detail scale using millimeters for both model and paper units.
+    Interprets the user input as: 1 mm paper = scale_model_mm mm drawing/model.
+
+    Args:
+        detail_id: GUID of the detail viewport
+        scale_model_mm: Number of millimeters in model that correspond to 1 mm on paper
+    """
+    try:
+        # Convert requested model length (mm) to current document model units
+        doc_units = Rhino.RhinoDoc.ActiveDoc.ModelUnitSystem
+        factor = Rhino.RhinoMath.UnitScale(
+            Rhino.UnitSystem.Millimeters, doc_units)
+        model_length_in_doc = float(scale_model_mm) * factor
+        paper_length_mm = 1.0  # page units are millimeters
+        # Determine model unit system name string for rs.DetailScale
+        unit_map = {
+            Rhino.UnitSystem.Millimeters: "Millimeters",
+            Rhino.UnitSystem.Centimeters: "Centimeters",
+            Rhino.UnitSystem.Meters: "Meters",
+            Rhino.UnitSystem.Inches: "Inches",
+            Rhino.UnitSystem.Feet: "Feet",
+        }
+        model_unit_name = unit_map.get(doc_units, None)
+        # Use explicit units so paper length is interpreted in mm
+        if model_unit_name:
+            rs.DetailScale(detail_id, model_length_in_doc,
+                           paper_length_mm, model_unit_name, "Millimeters")
+        else:
+            rs.DetailScale(detail_id, model_length_in_doc, paper_length_mm)
+        logger.debug("Applied detail scale: 1 mm paper = %.3f %s (from %.3f mm model)",
+                     model_length_in_doc, model_unit_name or "doc-units", float(scale_model_mm))
+        return True
+    except Exception:
+        logger.debug("Failed to apply millimeter detail scale.", exc_info=True)
+        return False
+
+
+def _center_detail_on_bbox(detail_id, bbox_points):
+    """
+    Center the active detail view on the provided bounding box center without changing scale.
+    Assumes the detail is currently showing the model in Top projection.
+    """
+    try:
+        if not bbox_points:
+            return False
+        # Compute center of bounding box
+        xs = [p.X if hasattr(p, "X") else p[0] for p in bbox_points]
+        ys = [p.Y if hasattr(p, "Y") else p[1] for p in bbox_points]
+        zs = [p.Z if hasattr(p, "Z") else (
+            p[2] if len(p) > 2 else 0.0) for p in bbox_points]
+        cx, cy, cz = sum(xs)/len(xs), sum(ys)/len(ys), sum(zs)/len(zs)
+        center = (cx, cy, cz)
+        # Activate the detail
+        try:
+            rs.CurrentDetail(detail_id, True)
+        except Exception:
+            logger.debug(
+                "Failed to activate detail for centering.", exc_info=True)
+        # Read current camera/target and preserve relative offset
+        try:
+            cam, tgt = rs.ViewCameraTarget()
+            if cam and tgt:
+                dx = cam[0] - tgt[0]
+                dy = cam[1] - tgt[1]
+                dz = cam[2] - tgt[2]
+                new_target = center
+                new_camera = (new_target[0] + dx,
+                              new_target[1] + dy, new_target[2] + dz)
+                rs.ViewCameraTarget(camera_point=new_camera,
+                                    target_point=new_target)
+                logger.debug(
+                    "Centered detail on bbox center at (%.3f, %.3f, %.3f)", cx, cy, cz)
+                return True
+        except Exception:
+            logger.debug(
+                "Failed to center detail via camera/target.", exc_info=True)
+        return False
+    except Exception:
+        logger.debug("Centering detail failed.", exc_info=True)
         return False
 
 
@@ -637,6 +787,44 @@ def _import_dwg_capture_new_objects(path):
             return diff
     logger.error("DWG import produced no new geometry: %s", path)
     return []
+
+
+def _derive_layout_name_from_objects(object_ids, fallback_name):
+    """
+    Derive a layout name from imported objects by inspecting their layers.
+    Strategy:
+      - Count occurrences of the top-level layer name among the provided objects
+      - Choose the most frequent top-level layer
+      - Sanitize and return that as the layout name
+      - Fallback to the provided fallback_name if nothing useful can be derived
+    """
+    try:
+        if not object_ids:
+            return fallback_name
+        layer_counts = {}
+        for oid in object_ids:
+            try:
+                layer_full = rs.ObjectLayer(oid)
+                if not layer_full:
+                    continue
+                top = layer_full.split("::", 1)[0]
+                if not top:
+                    continue
+                layer_counts[top] = layer_counts.get(top, 0) + 1
+            except Exception:
+                continue
+        if not layer_counts:
+            return fallback_name
+        # Pick highest count; tie-break by name
+        best = sorted(layer_counts.items(),
+                      key=lambda kv: (-kv[1], kv[0]))[0][0]
+        # Sanitize for layout names
+        safe = best.replace("/", "-").replace("\\", "-").strip()
+        return safe if safe else fallback_name
+    except Exception:
+        logger.debug(
+            "Failed to derive layout name from objects; using fallback.", exc_info=True)
+        return fallback_name
 
 
 def _zoom_selected_in_detail(detail_id, object_ids):
@@ -672,6 +860,81 @@ def _zoom_selected_in_detail(detail_id, object_ids):
         rs.UnselectAllObjects()
     except Exception:
         pass
+
+
+def _move_model_to_paperspace_and_center(detail_id, model_object_ids, page_view):
+    """
+    Move selected model objects to paperspace through the active detail (ChangeSpace),
+    then center them on the page and delete the detail viewport.
+    Returns the moved object ids (paperspace) or empty list on failure.
+    """
+    try:
+        if not model_object_ids:
+            return []
+        # Activate the detail
+        try:
+            rs.CurrentDetail(detail_id, True)
+        except Exception:
+            logger.debug(
+                "Detail activation before ChangeSpace failed.", exc_info=True)
+        # Select and move to paperspace via command
+        try:
+            rs.SelectObjects(model_object_ids)
+        except Exception:
+            pass
+        try:
+            # ChangeSpace moves objects from model to page space using current detail scale
+            rs.Command(u'_-ChangeSpace _Enter', echo=False)
+            time.sleep(0.2)
+        except Exception:
+            logger.debug("ChangeSpace command failed.", exc_info=True)
+        # Collect selected objects now in paperspace
+        try:
+            page_objs = rs.SelectedObjects() or []
+        except Exception:
+            page_objs = []
+        try:
+            rs.UnselectAllObjects()
+        except Exception:
+            pass
+        # If nothing selected, try to find objects on this page
+        if not page_objs:
+            try:
+                all_ids = rs.AllObjects() or []
+                page_objs = []
+                for oid in all_ids:
+                    obj = Rhino.RhinoDoc.ActiveDoc.Objects.Find(oid)
+                    if obj and obj.Attributes and obj.Attributes.Space == Rhino.DocObjects.ActiveSpace.PageSpace:
+                        if obj.Attributes.LayoutIndex == page_view.PageNumber:
+                            page_objs.append(oid)
+            except Exception:
+                logger.debug(
+                    "Fallback page objects discovery failed.", exc_info=True)
+        if not page_objs:
+            return []
+        # Center on page
+        try:
+            bbox = rs.BoundingBox(page_objs)
+            if bbox:
+                # bbox returns 8 points; compute center
+                xs = [p.X for p in bbox]
+                ys = [p.Y for p in bbox]
+                cx, cy = sum(xs)/len(xs), sum(ys)/len(ys)
+                page_cx, page_cy = page_view.PageWidth/2.0, page_view.PageHeight/2.0
+                dx, dy = page_cx - cx, page_cy - cy
+                if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+                    rs.MoveObjects(page_objs, (dx, dy, 0.0))
+        except Exception:
+            logger.debug("Centering page objects failed.", exc_info=True)
+        # Delete the detail viewport
+        try:
+            rs.DeleteObject(detail_id)
+        except Exception:
+            logger.debug("Failed to delete detail viewport.", exc_info=True)
+        return page_objs
+    except Exception:
+        logger.debug("Move to paperspace and center failed.", exc_info=True)
+        return []
 
 
 def _export_pdf_all_layouts(out_pdf_path):
@@ -855,7 +1118,15 @@ def assemble_from_dwgs(
             if dup_id:
                 # Rename the duplicated page to match DWG base
                 try:
-                    # dup_id is the page (layout) GUID; pass directly
+                    # Try RhinoCommon setter if we can resolve the page view now
+                    for v in Rhino.RhinoDoc.ActiveDoc.Views.GetPageViews():
+                        if getattr(v, "ActiveViewportID", None) == dup_id or v.PageName == master:
+                            try:
+                                v.PageName = name_base
+                                break
+                            except Exception:
+                                pass
+                    # Fallback to RhinoScriptSyntax by GUID
                     rs.RenameLayout(dup_id, name_base)
                 except Exception:
                     logger.debug(
@@ -907,6 +1178,12 @@ def assemble_from_dwgs(
             page_view, _ = _activate_layout_or_create(
                 name_base, width_mm=page_width_mm, height_mm=page_height_mm)
 
+        # Capture layout GUID early for later rename reliability
+        try:
+            layout_guid_for_rename = _resolve_layout_guid(page_view)
+        except Exception:
+            layout_guid_for_rename = None
+
         # Ensure a single detail
         # Validate that we have a valid page view
         if not isinstance(page_view, Rhino.Display.RhinoPageView):
@@ -933,23 +1210,21 @@ def assemble_from_dwgs(
             logger.error("Skipping layout due to empty import: %s", path)
             continue
 
-        # Set requested scale
-        # Convert scale_model_mm (mm) to meters for the detail scale function
-        # scale_model_m = scale_model_mm / 1000.0
+        # Set requested scale using millimeters (1 mm paper = scale_model_mm mm model)
         try:
-            # _set_detail_scale expects: paper_mm_per_model_unit = scale_paper_mm / scale_model_m
-            # where scale_model_m is in meters
-            # User input: 1mm page = scale_model_mm mm drawing
-            # So: scale_model_m = scale_model_mm / 1000.0 (convert mm to meters)
-            scale_model_m = scale_model_mm / 1000.0
-            _set_detail_scale(
-                detail_id, paper_mm_per_model_unit=scale_paper_mm/scale_model_m, model_unit="Meters")
+            _apply_detail_scale_mm(detail_id, scale_model_mm)
         except Exception:
             logger.debug(
-                "Detail scale helper failed, continuing.", exc_info=True)
+                "Detail scale application failed, continuing.", exc_info=True)
 
         # Zoom selected objects inside the detail
         _zoom_selected_in_detail(detail_id, new_ids)
+        # Move geometry into paperspace, center on page, and remove the detail viewport
+        try:
+            _move_model_to_paperspace_and_center(detail_id, new_ids, page_view)
+        except Exception:
+            logger.debug(
+                "Move to paperspace or centering failed.", exc_info=True)
 
         # Lock the detail to prevent accidental changes
         try:
@@ -957,8 +1232,21 @@ def assemble_from_dwgs(
         except Exception:
             pass
 
-        created_layouts.append(page_view.PageName)
-        logger.info("Prepared layout: %s", page_view.PageName)
+        # Enforce final layout name strictly as DWG base; add diagnostic logs
+        final_name = name_base
+        try:
+            ok_rename_final = _rename_layout(page_view, final_name)
+            logger.info("Final rename to DWG base '%s': %s",
+                        final_name, "ok" if ok_rename_final else "failed")
+            # Show current list to aid debugging
+            current_names = [
+                pv.PageName for pv in Rhino.RhinoDoc.ActiveDoc.Views.GetPageViews()]
+            logger.debug("Current layouts after rename: %s", current_names)
+        except Exception:
+            logger.debug("Final rename helper raised.", exc_info=True)
+        # Report final prepared layout name
+        created_layouts.append(final_name)
+        logger.info("Prepared layout: %s", final_name)
 
     # Export PDF(s)
     desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
@@ -980,7 +1268,7 @@ def main():
     """
     Entry point for interactive runs inside Rhino.
     Prompts user for:
-      - Page format (A4, A3, A2, A1)
+      - Page format (A5, A4, A3, A2, A1)
       - Drawing scale (1mm page = XX mm drawing)
       - Folder containing DWG files
     Exports combined PDF to Desktop/AssembledLayouts.pdf (or per-layout on fallback)
@@ -991,6 +1279,15 @@ def main():
         pass
 
     try:
+        # Announce in command history with spacing and version
+        try:
+            Rhino.RhinoApp.WriteLine("")
+            Rhino.RhinoApp.WriteLine("")
+            Rhino.RhinoApp.WriteLine(
+                "=== assemble_layouts.py v{} starting ===".format(__version__))
+        except Exception:
+            logger.debug(
+                "Failed to write start banner to Rhino command history.", exc_info=True)
         # Prompt for page format
         logger.info("Prompting for page format...")
         page_dims = _prompt_page_format()

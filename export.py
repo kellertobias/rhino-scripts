@@ -349,17 +349,25 @@ def _wait_for_file(path, timeout_seconds=20.0, poll_seconds=0.25):
 # Resolve DWG output path helper
 
 
-def _resolve_export_outpath(sectionName):
+def _resolve_export_outpath(sectionName, output_dir=None):
     """
     Compute the DWG output path for a given section name.
-    - Primary: user's Desktop
-    - Fallback: current working directory
+    - If output_dir is provided and valid, place file there
+    - Otherwise primary: user's Desktop; fallback: current working directory
     Filename: <sectionName>-Export.dwg
     """
-    desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
-    if not os.path.isdir(desktop):
-        desktop = os.getcwd()
-    return os.path.join(desktop, "{}-Export.dwg".format(sectionName))
+    try:
+        if output_dir and os.path.isdir(output_dir):
+            base = output_dir
+        else:
+            desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+            base = desktop if os.path.isdir(desktop) else os.getcwd()
+        return os.path.join(base, "{}-Export.dwg".format(sectionName))
+    except Exception:
+        # Last resort: ensure we return something writable with a safe filename
+        safe_name = "{}-Export.dwg".format(
+            re.sub(r"[^\w\-\.]+", "_", sectionName))
+        return os.path.join(output_dir or tempfile.gettempdir(), safe_name)
 
 # ---------- required API ----------
 
@@ -448,11 +456,16 @@ def generate_drawing(sectionName):
     return drawing_layer, created_layers
 
 
-def export_sublayers_dwg(drawingLayerName):
+def export_sublayers_dwg(drawingLayerName, output_dir=None, allow_overwrite=True):
     """
-    Unlock layer + all sublayers, select all their objects, and export ONLY those to Desktop as DWG.
+    Unlock layer + all sublayers, select all their objects, and export ONLY those to DWG.
     Filename: <sectionName>-Export.dwg (sectionName is the part after 'DRAWING_').
     Then re-lock the layers.
+
+    Args:
+        drawingLayerName: Name of the drawing layer tree, must start with 'DRAWING_'.
+        output_dir: Optional folder where the DWG should be written.
+        allow_overwrite: If False and file exists, skip writing and return existing path.
     """
     # Resolve export filename
     if not drawingLayerName.startswith("DRAWING_"):
@@ -460,9 +473,17 @@ def export_sublayers_dwg(drawingLayerName):
         raise Exception(
             "Unexpected drawing layer name: {}".format(drawingLayerName))
     sectionName = drawingLayerName[len("DRAWING_"):]
-    outpath = _resolve_export_outpath(sectionName)
+    outpath = _resolve_export_outpath(sectionName, output_dir=output_dir)
     logger.info("Exporting DWG for layer tree '%s' -> %s",
                 drawingLayerName, outpath)
+
+    # Respect overwrite policy early
+    try:
+        if (not allow_overwrite) and os.path.exists(outpath) and os.path.getsize(outpath) > 0:
+            logger.info("Skipping export (preserving existing): %s", outpath)
+            return outpath
+    except Exception:
+        logger.debug("Overwrite check failed for: %s", outpath, exc_info=True)
 
     # Collect layers and objects
     ids, layers = _objs_on_layer_and_children(drawingLayerName)
@@ -479,14 +500,16 @@ def export_sublayers_dwg(drawingLayerName):
     except Exception:
         logger.debug("Failed to select objects for export.", exc_info=True)
 
-    # Remove stale file
-    try:
-        if os.path.exists(outpath):
-            os.remove(outpath)
-            logger.debug("Removed existing file prior to export: %s", outpath)
-    except Exception:
-        logger.debug(
-            "Failed to remove existing export file (continuing): %s", outpath, exc_info=True)
+    # Remove stale file only when overwrite is allowed
+    if allow_overwrite:
+        try:
+            if os.path.exists(outpath):
+                os.remove(outpath)
+                logger.debug(
+                    "Removed existing file prior to export: %s", outpath)
+        except Exception:
+            logger.debug(
+                "Failed to remove existing export file (continuing): %s", outpath, exc_info=True)
 
     wrote = False
 
@@ -543,20 +566,26 @@ def cleanup_drawing(drawingLayerName):
     _delete_layer_tree(drawingLayerName)
 
 
-def export_deck(sectionName):
+def export_deck(sectionName, output_dir=None, allow_overwrite=True):
     """
     Orchestrates a single deck export:
       1) generate_drawing(sectionName) -> (drawingLayerName, createdTempLayers)
       2) export_sublayers_dwg(drawingLayerName)
       3) delete createdTempLayers (from ClippingDrawings)
       4) cleanup_drawing(drawingLayerName)
-      5) If DWG already exists before starting, skip exporting this deck.
+      5) If DWG already exists before starting and allow_overwrite is False, skip.
+
+    Args:
+        sectionName: The clipping plane name to export.
+        output_dir: Optional destination folder for the DWG.
+        allow_overwrite: If False and the output file exists, skip this export.
     """
     logger.info("Starting deck export for: %s", sectionName)
     # Skip if output already exists to avoid re-exporting the same deck
     try:
-        preexisting_out = _resolve_export_outpath(sectionName)
-        if os.path.exists(preexisting_out) and os.path.getsize(preexisting_out) > 0:
+        preexisting_out = _resolve_export_outpath(
+            sectionName, output_dir=output_dir)
+        if (not allow_overwrite) and os.path.exists(preexisting_out) and os.path.getsize(preexisting_out) > 0:
             logger.info("Skipping export for %s; DWG already exists: %s",
                         sectionName, preexisting_out)
             return preexisting_out
@@ -569,7 +598,8 @@ def export_deck(sectionName):
     out = None
     try:
         drawing_layer, created_temp_layers = generate_drawing(sectionName)
-        out = export_sublayers_dwg(drawing_layer)
+        out = export_sublayers_dwg(
+            drawing_layer, output_dir=output_dir, allow_overwrite=allow_overwrite)
         return out
     finally:
         # Always delete the temporary layers created by ClippingDrawings to avoid Rhino layer bloat
@@ -592,20 +622,22 @@ def export_deck(sectionName):
             logger.info(
                 "Export finished with no output path for %s (likely failed earlier).", sectionName)
 
-# ---------- run for all sections starting with DECK_ ----------
+# ---------- discovery and interactive prompts ----------
 
 
-def _all_deck_section_names():
-    """Collect names of all clipping planes starting with DECK_."""
+def _all_section_names_with_prefix(prefix):
+    """
+    Collect names of all clipping planes whose name starts with the given prefix.
+    Names are returned in case-insensitive sorted order for stability.
+    """
     names = []
     doc = Rhino.RhinoDoc.ActiveDoc
     for obj in doc.Objects.GetObjectList(Rhino.DocObjects.ObjectType.ClipPlane):
         nm = obj.Attributes.Name or ""
-        if nm.startswith("DECK_"):
+        if nm.startswith(prefix):
             names.append(nm)
-    # Stable sort by name
     names.sort(key=lambda s: s.lower())
-    logger.info("Discovered %d DECK_* sections.", len(names))
+    logger.info("Discovered %d sections with prefix '%s'.", len(names), prefix)
     return names
 
 
@@ -620,21 +652,199 @@ def _force_parallel_projection():
         logger.debug("Failed to force parallel projection.", exc_info=True)
 
 
+def _prompt_prefix(default_prefix="FLOOR_"):
+    """
+    Prompt the user for the clipping section prefix.
+    Defaults to 'FLOOR_' if user accepts default or submits empty.
+    Returns the prefix string, or None if cancelled.
+    """
+    try:
+        result = rs.GetString("Enter section prefix", default_prefix)
+    except Exception:
+        result = default_prefix
+    if result is None:
+        return None
+    result = result.strip()
+    return result if result else default_prefix
+
+
+def _confirm_sections_list(sections):
+    """
+    Show the list of matched sections and ask the user to confirm to continue.
+    Returns True to continue, False to abort.
+    """
+    if not sections:
+        logger.warning("No sections matched the given prefix.")
+        return False
+    logger.info("Matched sections (%d): %s",
+                len(sections), ", ".join(sections))
+    try:
+        resp = rs.GetString("Continue with these sections? (Y/N) [Y]", "Y")
+    except Exception:
+        resp = "Y"
+    if resp is None:
+        return False
+    resp = (resp or "Y").strip().lower()
+    return resp.startswith("y")
+
+
+def _prompt_export_folder():
+    """
+    Prompt the user to select the export folder via UI; fallback to Desktop on text input.
+    Returns folder path or None if cancelled.
+    """
+    try:
+        folder = rs.BrowseForFolder(
+            message="Select export folder for DWG files")
+        if folder and os.path.isdir(folder):
+            logger.info("Selected export folder: %s", folder)
+            return folder
+    except Exception:
+        logger.debug(
+            "BrowseForFolder failed, falling back to string prompt.", exc_info=True)
+    desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+    prompt = "Enter export folder path [{}]: ".format(desktop)
+    try:
+        result = rs.GetString(prompt, desktop)
+    except Exception:
+        result = desktop
+    if result is None:
+        return None
+    result = os.path.expanduser((result or desktop).strip())
+    if not os.path.isdir(result):
+        logger.error("Invalid export folder: %s", result)
+        return None
+    logger.info("Selected export folder: %s", result)
+    return result
+
+
+def _select_existing_to_overwrite(section_to_path):
+    """
+    Given a mapping of section -> outpath, show which files already exist and
+    let the user select which of them to overwrite.
+    Returns a set of section names that the user chose to overwrite.
+    If no files exist, returns an empty set (caller can skip selection).
+    """
+    existing = [(sec, p) for sec, p in section_to_path.items()
+                if os.path.exists(p) and os.path.getsize(p) > 0]
+    if not existing:
+        return set()
+
+    rows = []
+    for sec, p in existing:
+        rows.append([sec, p])
+
+    selected_secs = set()
+    # Try multi-selection dialog if available
+    try:
+        selection = rs.MultiListBox(rows, ["Section", "Existing File"],
+                                    "Select existing files to OVERWRITE",
+                                    "Overwrite Existing Exports")
+        if selection:
+            for row in selection:
+                if row and len(row) > 0:
+                    selected_secs.add(row[0])
+            return selected_secs
+    except Exception:
+        logger.debug(
+            "MultiListBox not available; falling back to typed selection.", exc_info=True)
+
+    # Fallback: display and accept comma-separated indices
+    logger.info("Existing exports:")
+    for idx, (sec, p) in enumerate(existing, 1):
+        logger.info("%d) %s -> %s", idx, sec, p)
+    try:
+        raw = rs.GetString(
+            "Enter numbers to overwrite (comma-separated), or 'none'/'all' [none]", "none")
+    except Exception:
+        raw = "none"
+    if raw is None:
+        return set()
+    raw = (raw or "none").strip().lower()
+    if raw == "all":
+        return {sec for sec, _ in existing}
+    if raw == "none" or raw == "":
+        return set()
+    try:
+        indices = [int(x.strip())
+                   for x in raw.split(",") if x.strip().isdigit()]
+        for i in indices:
+            if 1 <= i <= len(existing):
+                selected_secs.add(existing[i-1][0])
+    except Exception:
+        logger.debug(
+            "Failed to parse selection; defaulting to none.", exc_info=True)
+    return selected_secs
+
+
 def main():
-    logger.info("Starting export run.")
+    """
+    Interactive export workflow:
+      1) Ask for section prefix (default 'FLOOR_')
+      2) Show matched sections and confirm to continue
+      3) Ask for export folder (file picker dialog)
+      4) Show which export files already exist and let the user select which to overwrite
+         (if none exist, this step is skipped)
+      5) Export the selected sections
+    """
+    logger.info("Starting interactive export.")
     if not _activate_model_view():
         logger.error("No model view. Abort.")
         return
     _force_parallel_projection()
 
-    sections = _all_deck_section_names()
-    if not sections:
-        logger.warning("No clipping sections starting with DECK_.")
+    # 1) Prefix prompt
+    prefix = _prompt_prefix(default_prefix="FLOOR_")
+    if prefix is None:
+        logger.warning("Prefix prompt cancelled.")
         return
 
+    # 2) Discover and confirm sections
+    sections = _all_section_names_with_prefix(prefix)
+    if not sections:
+        logger.warning("No clipping sections starting with %s.", prefix)
+        return
+    if not _confirm_sections_list(sections):
+        logger.info("User declined to continue with matched sections.")
+        return
+
+    # 3) Export folder
+    export_folder = _prompt_export_folder()
+    if export_folder is None:
+        logger.error("Export folder selection cancelled. Aborting.")
+        return
+
+    # Map each section to its intended outpath
+    section_to_outpath = {}
     for sec in sections:
+        section_to_outpath[sec] = _resolve_export_outpath(
+            sec, output_dir=export_folder)
+
+    # 4) Existing file selection
+    overwrite_existing_secs = _select_existing_to_overwrite(section_to_outpath)
+
+    # Determine final set of sections to export:
+    # - Always include those without an existing file
+    # - Include those user selected to overwrite
+    to_export = []
+    for sec, outp in section_to_outpath.items():
+        exists = False
         try:
-            export_deck(sec)
+            exists = os.path.exists(outp) and os.path.getsize(outp) > 0
+        except Exception:
+            exists = os.path.exists(outp)
+        if (not exists) or (sec in overwrite_existing_secs):
+            to_export.append(sec)
+    if not to_export:
+        logger.info("Nothing to export based on current selections.")
+        return
+
+    # 5) Export
+    for sec in to_export:
+        try:
+            allow_overwrite = sec in overwrite_existing_secs
+            export_deck(sec, output_dir=export_folder,
+                        allow_overwrite=allow_overwrite)
         except Exception as e:
             logger.exception("FAIL %s -> %s", sec, e)
 
